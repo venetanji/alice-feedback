@@ -269,7 +269,7 @@ class MaestroController:
         else:
             # Map from 0.0...1.0 to neutral...max
             target = cfg['neutral_qus'] + ((cfg['max_qus'] - cfg['neutral_qus']) * position)
-        print(f"Setting channel {channel} to target: {target}") 
+        #print(f"Setting channel {channel} to target: {target}") 
         self.set_target(channel, int(target))
     
     def generate_motor_ranges_yaml(self, channels_to_check=None, filename="motor_ranges.yaml"):
