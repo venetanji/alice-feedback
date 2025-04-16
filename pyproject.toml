@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alice_feedback"
+version = "0.1.0"
+description = "A system for controlling and mimicking facial expressions with motors"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+
+dependencies = [
+    "numpy",
+    "mediapipe",
+    "PyYAML",
+    "pyserial",
+]
+
+[project.optional-dependencies]
+# CPU-only dependencies
+cpu = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "opencv-python>=4.8.0",
+]
+# CUDA dependencies
+cuda = [
+    #"opencv-python==4.11.0.86",
+    "torch>=2.6.0",
+    "torchvision>=0.15.0",
+]
+
+[project.scripts]
+alice-feedback = "alice_feedback.cli:main"
+
+[tool.setuptools]
+packages = ["alice_feedback"]
+
+# Configure PyTorch with CUDA
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cuda", extra = "cuda" },
+    { index = "pytorch-cpu", extra = "cpu" },
+]
+torchvision = [
+    { index = "pytorch-cuda", extra = "cuda" },
+    { index = "pytorch-cpu", extra = "cpu" },
+]
+
+# PyTorch index definitions
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+# Ensure that cpu and cuda extras conflict
+[tool.uv]
+override-dependencies = [
+    "opencv-contrib-python ; sys_platform == 'never'",
+]
+
+conflicts = [
+    [{ extra = "cpu" }, { extra = "cuda" }],
+]
