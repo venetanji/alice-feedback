@@ -67,6 +67,10 @@ class MaestroController:
         """
         target = max(0, min(target, 8000))  # Clamp target to valid range
         
+        # create empty channel if it doesn't exist
+        if channel not in self.channels:
+            self.channels[channel] = {}
+        
         # Track target for this channel
         self.channels[channel].update({
             'target': target,
@@ -294,7 +298,7 @@ class MaestroController:
             dict: The motor ranges data that was saved to the file
         """
         if channels_to_check is None:
-            channels_to_check = range(6)  # Default to first 6 channels
+            channels_to_check = range(12)  # Default to first 6 channels
             
         # First send all servos to home position
         self.go_home()

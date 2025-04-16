@@ -6,7 +6,7 @@ import time
 from .maestro import MaestroController
 
 class MotorController:
-    def __init__(self, port="COM6", baudrate=9600, yaml_file="motor_ranges.yaml"):
+    def __init__(self, port="COM6", baudrate=9600, yaml_file="config/motor_ranges.yaml"):
         """
         Initialize the motor controller.
         

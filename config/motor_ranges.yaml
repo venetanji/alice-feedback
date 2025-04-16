@@ -1,8 +1,8 @@
 channel_10:
-  max_position: 6784
-  max_us: 1696.0
-  min_position: 5696
-  min_us: 1424.0
+  max_position: 6272
+  max_us: 1568.0
+  min_position: 5824
+  min_us: 1456.0
   neutral_position: 5998
   neutral_us: 1499.5
 channel_11:
@@ -13,8 +13,8 @@ channel_11:
   neutral_position: 5524
   neutral_us: 1381.0
 channel_3:
-  max_position: 6400
-  max_us: 1600.0
+  max_position: 6066
+  max_us: 1516.5
   min_position: 3136
   min_us: 784.0
   neutral_position: 5626
@@ -26,6 +26,13 @@ channel_4:
   min_us: 1232.0
   neutral_position: 6173
   neutral_us: 1543.25
+channel_5:
+  max_position: 7232
+  max_us: 1808.0
+  min_position: 6016
+  min_us: 1504.0
+  neutral_position: 6208
+  neutral_us: 1552.0
 channel_6:
   max_position: 5312
   max_us: 1328.0
@@ -33,13 +40,6 @@ channel_6:
   min_us: 1248.0
   neutral_position: 5059
   neutral_us: 1264.75
-channel_7:
-  max_position: 6496
-  max_us: 1624.0
-  min_position: 4996
-  min_us: 1249.0
-  neutral_position: 6496
-  neutral_us: 1624.0
 channel_8:
   max_position: 6336
   max_us: 1584.0

@@ -9,9 +9,15 @@ import torch
 import time
 import mediapipe as mp
 from torch.utils.data import DataLoader
+import torch.optim as optim
 
 from ..utils.facial_landmarks import create_face_landmarker, create_face_mesh, draw_face_mesh
-from ..models.optimizer import extract_blendshapes, calculate_blendshape_mse, optimize_motor_positions
+from ..models.optimizer import (
+    extract_blendshapes, 
+    calculate_blendshape_mse, 
+    JacobianOptimizer, 
+)
+from ..models.neural_network import LandmarkToMotorModel
 
 async def mimicry_loop(human_cam_id, robot_cam_id, motor_controller, model, dataset, training_control):
     """
@@ -55,15 +61,23 @@ async def mimicry_loop(human_cam_id, robot_cam_id, motor_controller, model, data
     # Store first received blendshape dimension to check consistency
     blendshape_dim = None
 
-    # Status indicator for display
-    status_text = "Training: OFF (Press 'T' to toggle)"
-    collect_data = False
+    # Status indicators for display
+    training_status = "Training: OFF (Press 'T' to toggle)"
+    record_status = "Record: OFF (Press 'R' to toggle)"
+    mimicry_status = "Mimicry: ON (Press 'C' to toggle)"
+    
+    # Control flags
+    collect_data = False  # 'R' toggles this
+    mimicry_enabled = True  # 'C' toggles this
+    
     # Flag to toggle face mesh rendering
     show_face_mesh = True
 
     # For drawing face mesh on the display (still useful for visualization)
     human_face_mesh = create_face_mesh()
     robot_face_mesh = create_face_mesh()
+    
+    jacobian_optimizer = None
 
     while True:
         ret_human, human_frame = human_cap.read()
@@ -97,39 +111,82 @@ async def mimicry_loop(human_cam_id, robot_cam_id, motor_controller, model, data
                 # If the model input dimension doesn't match, recreate it
                 if model.input_dim != blendshape_dim:
                     print(f"Recreating model with input dim {blendshape_dim} instead of {model.input_dim}")
-                    model = LandmarkToMotorModel(blendshape_dim, model.fc[-1].out_features).to(device)
-                    optimizer = optim.Adam(model.parameters(), lr=0.001)
-            
-            # Use model to directly predict motor positions for inference
-            human_blendshapes_tensor = torch.tensor(human_blendshapes, dtype=torch.float32).to(device).unsqueeze(0)
-            predicted_motor_positions = model(human_blendshapes_tensor).detach().cpu().numpy()[0]
-            motor_controller.adjust_motors(predicted_motor_positions)
-            
-            # If data collection is enabled, optimize and collect data points
-            if collect_data:
-                # Use the optimization function to iteratively adjust motors for this frame
-                print("Starting motor position optimization for current frame...")
-                optimized_blendshapes, best_motor_positions = await optimize_motor_positions(
-                    human_blendshapes=human_blendshapes,
-                    model=model,
+                    output_dim = model.fc[-1].out_features
+                    model = LandmarkToMotorModel(blendshape_dim, output_dim).to(device)
+                
+                # Also update the Jacobian optimizer's blendshape dimension if needed
+                print(f"Initializing Jacobian with dimensions: {blendshape_dim}")
+                
+                # Create a new optimizer with the correct dimension
+                jacobian_optimizer = JacobianOptimizer(
+                    motor_controller.get_num_motors(), 
+                    blendshape_dim
+                )
+                
+                # Recalibrate with correct dimension using the direct method
+                success = await jacobian_optimizer.calibrate_with_robot(
                     motor_controller=motor_controller,
                     face_landmarker=face_landmarker,
                     robot_cap=robot_cap,
                     device=device,
-                    max_iterations=30,
-                    patience=6,
-                    improvement_threshold=0.001
+                    dataset=dataset,
+                    add_to_dataset=True
                 )
                 
-                # If optimization was successful, add the best data point to the dataset
-                if optimized_blendshapes is not None:
-                    print("Optimization complete, saving optimized data point")
-                    dataset.add_data(optimized_blendshapes, best_motor_positions)
+                if not success:
+                    print("[FATAL] Jacobian calibration failed. Exiting.")
+                    break
+            
+            
+            # If mimicry is enabled, adjust motors based on human blendshapes
+            if mimicry_enabled:
+                # Capture current robot frame to get current blendshapes
+                ret_robot, robot_frame = robot_cap.read()
+                if ret_robot:
+                    robot_rgb_frame = cv2.cvtColor(robot_frame, cv2.COLOR_BGR2RGB)
+                    mp_robot_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=robot_rgb_frame)
+                    robot_results = face_landmarker.detect(mp_robot_image)
+                    robot_blendshapes = extract_blendshapes(robot_results)
                     
-                    # Set motors to best position found 
-                    motor_controller.adjust_motors(best_motor_positions)
+                    # If we have both human and robot blendshapes, use iterative optimization
+                    if robot_blendshapes is not None and jacobian_optimizer and jacobian_optimizer.is_calibrated:
+                        _, new_motor_positions = await jacobian_optimizer.optimize_iteratively(
+                            human_blendshapes=human_blendshapes,
+                            model=model,
+                            motor_controller=motor_controller,
+                            face_landmarker=face_landmarker,
+                            robot_cap=robot_cap,
+                            device=device,
+                            max_iterations=10,  # Keep iterations low for real-time response
+                            improvement_threshold=0.001,
+                            patience=2
+                        )
+                        # Apply the motor positions if optimization was successful
+                        if new_motor_positions is not None:
+                            motor_controller.adjust_motors(new_motor_positions)
+                            await asyncio.sleep(0.1)
+                    else:
+                        # Fallback to model if we can't use Jacobian
+                        human_blendshapes_tensor = torch.tensor(human_blendshapes, dtype=torch.float32).to(device).unsqueeze(0)
+                        predicted_motor_positions = model(human_blendshapes_tensor).detach().cpu().numpy()[0]
+                        motor_controller.adjust_motors(predicted_motor_positions)
+                else:
+                    print("Warning: Could not read robot camera frame for blendshape comparison")
+                
+                if collect_data:
+                    current_motor_positions = motor_controller.get_motor_positions().copy()
+                    print(f"Adding data point: blendshape dim {len(human_blendshapes)}, motor dim {len(current_motor_positions)}")
+                    dataset.add_data(human_blendshapes, current_motor_positions)
+            else:
+                # Mimicry is disabled, use model to make predictions
+                human_blendshapes_tensor = torch.tensor(human_blendshapes, dtype=torch.float32).to(device).unsqueeze(0)
+                predicted_motor_positions = model(human_blendshapes_tensor).detach().cpu().numpy()[0]
+                motor_controller.adjust_motors(predicted_motor_positions)
+            
+            # If data collection is enabled, add the current blendshape and motor position to the dataset
 
-        # Get a final robot frame to display with the optimized positions
+
+        # Get a final robot frame to display with the current positions
         ret_robot, robot_frame = robot_cap.read()
         if ret_robot:
             robot_rgb_frame = cv2.cvtColor(robot_frame, cv2.COLOR_BGR2RGB)
@@ -155,10 +212,14 @@ async def mimicry_loop(human_cam_id, robot_cam_id, motor_controller, model, data
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             
             # Display the robot frame with status text
-            cv2.putText(robot_frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.putText(robot_frame, training_status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            # Display record status
+            cv2.putText(robot_frame, record_status, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            # Display mimicry status
+            cv2.putText(robot_frame, mimicry_status, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             # Display face mesh status
             mesh_status = "Face Mesh: ON (Press 'M' to toggle)" if show_face_mesh else "Face Mesh: OFF (Press 'M' to toggle)"
-            cv2.putText(robot_frame, mesh_status, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.putText(robot_frame, mesh_status, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             cv2.imshow("Robot Camera", robot_frame)
 
         # Display the human frame
@@ -167,13 +228,19 @@ async def mimicry_loop(human_cam_id, robot_cam_id, motor_controller, model, data
         mesh_status = "Face Mesh: ON (Press 'M' to toggle)" if show_face_mesh else "Face Mesh: OFF (Press 'M' to toggle)"
         cv2.putText(human_frame, mesh_status, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         
+        # Display record status
+        cv2.putText(human_frame, record_status, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        # Display mimicry status
+        cv2.putText(human_frame, mimicry_status, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
         # Display blendshape info if available
         if human_blendshapes is not None:
             # Show top 3 active blendshapes
             top_indices = np.argsort(human_blendshapes)[-3:][::-1]
             for i, idx in enumerate(top_indices):
                 cv2.putText(human_frame, f"Blend[{idx}]: {human_blendshapes[idx]:.2f}", 
-                           (10, 90 + i*30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                           (10, 150 + i*30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         
         cv2.imshow("Human Camera", human_frame)
 
@@ -188,19 +255,33 @@ async def mimicry_loop(human_cam_id, robot_cam_id, motor_controller, model, data
         elif key == ord('t'):
             training_control['enabled'] = not training_control['enabled']
             if training_control['enabled']:
-                status_text = "Training: ON (Press 'T' to toggle)"
+                training_status = "Training: ON (Press 'T' to toggle)"
                 print("Training enabled")
             else:
-                status_text = "Training: OFF (Press 'T' to toggle)"
+                training_status = "Training: OFF (Press 'T' to toggle)"
                 print("Training disabled")
                 
-        # 'd' to toggle data collection on/off
-        elif key == ord('d'):
+        # 'r' to toggle data recording on/off
+        elif key == ord('r'):
             collect_data = not collect_data
             if collect_data:
-                print("Data collection enabled")
+                record_status = "Record: ON (Press 'R' to toggle)"
+                print("Data recording enabled")
             else:
-                print("Data collection disabled")
+                record_status = "Record: OFF (Press 'R' to toggle)"
+                print("Data recording disabled")
+                
+        # 'c' to toggle mimicry on/off
+        elif key == ord('c'):
+            mimicry_enabled = not mimicry_enabled
+            if mimicry_enabled:
+                mimicry_status = "Mimicry: ON (Press 'C' to toggle)"
+                print("Mimicry enabled")
+            else:
+                mimicry_status = "Mimicry: OFF (Press 'C' to toggle)"
+                print("Mimicry disabled")
+                # Center all motors when turning off mimicry
+                motor_controller.center_all_motors()
         
         # 'm' to toggle face mesh rendering on/off
         elif key == ord('m'):
@@ -214,7 +295,8 @@ async def mimicry_loop(human_cam_id, robot_cam_id, motor_controller, model, data
         elif key == ord('s'):
             model_path = f"facial_mimicry_model_{time.strftime('%Y%m%d_%H%M%S')}.pt"
             model.save_to_file(model_path)
-            
+            print(f"Model saved to {model_path}")
+                
         # Add a small delay to allow other coroutines to run
         await asyncio.sleep(0.01)
 

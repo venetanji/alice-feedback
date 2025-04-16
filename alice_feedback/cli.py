@@ -14,9 +14,15 @@ from torch.utils.data import DataLoader
 
 from alice_feedback.models.neural_network import RealTimeDataset, LandmarkToMotorModel
 from alice_feedback.controllers.motor_controller import MotorController
+from alice_feedback.controllers.maestro import MaestroController
 from alice_feedback.ui.mimicry import mimicry_loop, training_loop
-from alice_feedback.utils.facial_landmarks import create_face_landmarker, create_face_mesh, draw_face_mesh
-from alice_feedback.models.optimizer import generate_initial_dataset
+from alice_feedback.utils.facial_landmarks import create_face_mesh, draw_face_mesh
+
+# Default arguments
+DEFAULT_HUMAN_CAMERA = 0
+DEFAULT_ROBOT_CAMERA = 5
+DEFAULT_PORT = "COM6"
+DEFAULT_MOTOR_RANGES_FILE = "config/motor_ranges.yaml"
 
 async def process_camera(camera_id, window_name):
     """
@@ -157,6 +163,32 @@ def list_cameras_cmd(args):
     else:
         print("No cameras found.")
 
+def calibrate_motors_cmd(args):
+    """
+    Command handler for calibrating motor ranges
+    """
+    print(f"Starting motor calibration on port {args.port}")
+    
+    # Initialize Maestro controller
+    try:
+        controller = MaestroController(port=args.port)
+        print("Connected to Maestro controller")
+        
+        # Create config directory if it doesn't exist
+        os.makedirs(os.path.dirname(args.motor_ranges_file), exist_ok=True)
+        
+        # Generate motor ranges YAML
+        motor_ranges = controller.generate_motor_ranges_yaml(
+            channels_to_check=args.channels,
+            filename=args.motor_ranges_file
+        )
+        print(f"Motor ranges calibration completed and saved to {args.motor_ranges_file}")
+        
+
+    finally:
+        if 'controller' in locals():
+            controller.close()
+
 async def main_async(args):
     """
     Main asynchronous function to run the facial mimicry system
@@ -202,72 +234,11 @@ async def main_async(args):
     # Define optimizer and loss function
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.MSELoss()
-
-    # Generate initial dataset if requested
-    if args.generate_initial_dataset:
-        # Set up robot capture for initial data collection
-        robot_cap = cv2.VideoCapture(args.robot_camera)
-        if not robot_cap.isOpened():
-            print("Error: Could not open robot camera for initial data collection.")
-            return
-        
-        try:
-            # Create MediaPipe Face Landmarker with blendshapes enabled
-            face_landmarker = create_face_landmarker()
-            print("MediaPipe Face Landmarker initialized with blendshapes")
-            
-            # Generate initial dataset with neutral, min, and max positions for each motor
-            print("Generating initial data points for the dataset...")
-            initial_data = await generate_initial_dataset(
-                motor_controller=motor_controller,
-                face_landmarker=face_landmarker,
-                robot_cap=robot_cap,
-                device=device,
-                samples_per_position=3
-            )
-            
-            # Add initial data points to the dataset
-            for blendshapes, motor_positions in initial_data:
-                dataset.add_data(blendshapes, motor_positions)
-            
-            print(f"Added {len(initial_data)} initial data points to the dataset")
-            
-            # Perform initial training to establish a baseline model
-            if len(dataset) > 0:
-                print("Performing initial training with baseline data...")
-                dataloader = DataLoader(dataset, batch_size=min(8, len(dataset)), shuffle=True)
-                
-                # Do a few epochs of initial training
-                for epoch in range(10):
-                    total_loss = 0
-                    for human_blendshapes, motor_positions in dataloader:
-                        # Move tensors to the correct device
-                        human_blendshapes = human_blendshapes.to(device)
-                        motor_positions = motor_positions.to(device)
-                        
-                        optimizer.zero_grad()
-                        # Forward pass
-                        predictions = model(human_blendshapes)
-                        # Compute loss
-                        loss = criterion(predictions, motor_positions)
-                        # Backward pass
-                        loss.backward()
-                        optimizer.step()
-                        
-                        total_loss += loss.item()
-                    
-                    # Print progress
-                    avg_loss = total_loss / len(dataloader)
-                    print(f"Initial training - Epoch {epoch+1}/10, Loss: {avg_loss:.6f}")
-        
-        except Exception as e:
-            print(f"Error during initial data generation: {e}")
-        finally:
-            # Release the camera when done
-            robot_cap.release()
-
+    
     # Training control dictionary
-    training_control = {'enabled': args.training_enabled}
+    training_control = {
+        'enabled': args.training_enabled,
+    }
 
     # Start both loops as tasks
     mimicry_task = asyncio.create_task(
@@ -301,29 +272,28 @@ def main():
     
     # Common arguments used by multiple commands
     common_parser = argparse.ArgumentParser(add_help=False)
-    common_parser.add_argument("--human-camera", type=int, default=0,
-                        help="Camera ID for human-facing camera (default: 0)")
-    common_parser.add_argument("--robot-camera", type=int, default=1,
-                        help="Camera ID for robot-facing camera (default: 1)")
+    common_parser.add_argument("--human-camera", type=int, default=DEFAULT_HUMAN_CAMERA,
+                        help=f"Camera ID for human-facing camera (default: {DEFAULT_HUMAN_CAMERA})")
+    common_parser.add_argument("--robot-camera", type=int, default=DEFAULT_ROBOT_CAMERA,
+                        help=f"Camera ID for robot-facing camera (default: {DEFAULT_ROBOT_CAMERA})")
     
     # Parser for the main mimicry command (default)
     mimicry_parser = subparsers.add_parser("mimicry", parents=[common_parser],
                                         help="Run the facial mimicry system")
     # Motor controller settings
-    mimicry_parser.add_argument("--port", type=str, default="COM6",
-                        help="Serial port for the Maestro controller (default: COM6)")
-    mimicry_parser.add_argument("--motor-ranges-file", type=str, default="motor_ranges.yaml",
-                        help="Path to YAML file with motor range calibration (default: motor_ranges.yaml)")
+    mimicry_parser.add_argument("--port", type=str, default=DEFAULT_PORT,
+                        help=f"Serial port for the Maestro controller (default: {DEFAULT_PORT})")
+    mimicry_parser.add_argument("--motor-ranges-file", type=str, default=DEFAULT_MOTOR_RANGES_FILE,
+                        help=f"Path to YAML file with motor range calibration (default: {DEFAULT_MOTOR_RANGES_FILE})")
     # Model settings
     mimicry_parser.add_argument("--model-file", type=str, default=None,
                         help="Path to saved model file to load (default: None, creates new model)")
     mimicry_parser.add_argument("--cpu", action="store_true",
                         help="Force using CPU even if CUDA is available")
+    
     # Training settings
     mimicry_parser.add_argument("--training-enabled", action="store_true",
                         help="Enable training mode at startup")
-    mimicry_parser.add_argument("--generate-initial-dataset", action="store_true",
-                        help="Generate initial dataset with neutral and extremes for each motor")
     
     # Parser for the test_cameras command
     test_parser = subparsers.add_parser("test_cameras", parents=[common_parser],
@@ -335,6 +305,16 @@ def main():
     list_parser.add_argument("--show", action="store_true",
                         help="Show preview windows for all cameras")
     
+    # Parser for the calibrate_motors command
+    calibrate_parser = subparsers.add_parser("calibrate_motors",
+                                    help="Calibrate motor ranges")
+    calibrate_parser.add_argument("--port", type=str, default=DEFAULT_PORT,
+                        help=f"Serial port for the Maestro controller (default: {DEFAULT_PORT})")
+    calibrate_parser.add_argument("--motor-ranges-file", type=str, default=DEFAULT_MOTOR_RANGES_FILE,
+                        help=f"Path to YAML file to save motor ranges (default: {DEFAULT_MOTOR_RANGES_FILE})")
+    calibrate_parser.add_argument("--channels", type=int, nargs='+', default=None,
+                        help="List of channels to calibrate (default: None, calibrates all channels)")
+    
     # Parse arguments
     args = parser.parse_args()
     
@@ -344,19 +324,21 @@ def main():
     
     # Route to the appropriate command handler
     if args.command == "mimicry":
-        # Add default arguments needed for mimicry if they weren't added by the subparser
+        # Add default arguments for mimicry if they weren't set
+        if not hasattr(args, 'human_camera'):
+            args.human_camera = DEFAULT_HUMAN_CAMERA
+        if not hasattr(args, 'robot_camera'):
+            args.robot_camera = DEFAULT_ROBOT_CAMERA
         if not hasattr(args, 'port'):
-            args.port = "COM6"
+            args.port = DEFAULT_PORT
         if not hasattr(args, 'motor_ranges_file'):
-            args.motor_ranges_file = "motor_ranges.yaml"
+            args.motor_ranges_file = DEFAULT_MOTOR_RANGES_FILE
         if not hasattr(args, 'model_file'):
             args.model_file = None
         if not hasattr(args, 'cpu'):
             args.cpu = False
         if not hasattr(args, 'training_enabled'):
             args.training_enabled = False
-        if not hasattr(args, 'generate_initial_dataset'):
-            args.generate_initial_dataset = False
         
         # Run the main mimicry system
         asyncio.run(main_async(args))
@@ -366,6 +348,9 @@ def main():
     elif args.command == "list_cameras":
         # List available cameras
         list_cameras_cmd(args)
+    elif args.command == "calibrate_motors":
+        # Calibrate motor ranges
+        calibrate_motors_cmd(args)
     else:
         parser.print_help()
 
