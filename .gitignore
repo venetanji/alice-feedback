@@ -164,3 +164,4 @@ cython_debug/
 
 # Project-specific files
 facial_mimicry_model_*.pt
+face_landmarker.task

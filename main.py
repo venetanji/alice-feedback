@@ -95,9 +95,57 @@ async def optimize_motor_positions(human_blendshapes, model, motor_controller, f
     # Keep track of MSE history to detect oscillations
     mse_history = []
     
-    # Initialize PID controllers for each motor
+    # Initialize PID controllers for each motor with motor-specific settings
     num_motors = len(motor_controller.get_motor_positions())
-    pid_controllers = [PIDController(kp=0.3, ki=0.05, kd=0.1) for _ in range(num_motors)]
+    pid_controllers = []
+    
+    # Setup PID controllers with motor-specific parameters from YAML if available
+    try:
+        # Try to get motor calibration info from the controller
+        motor_info = {}
+        if hasattr(motor_controller, 'maestro') and motor_controller.connected:
+            for i, channel in enumerate(motor_controller.get_active_channels()):
+                cfg = motor_controller.maestro.channels[channel]
+                # Calculate motor range as a ratio compared to "standard" range
+                # Standard range would be 1000 quarter-microseconds from min to neutral
+                # and 1000 from neutral to max
+                min_range = cfg['neutral_qus'] - cfg['min_qus']
+                max_range = cfg['max_qus'] - cfg['neutral_qus']
+                avg_range = (min_range + max_range) / 2
+                
+                # Calculate responsiveness factor (how much physical movement per command)
+                responsiveness = 1000 / avg_range if avg_range > 0 else 1.0
+                
+                # Motors with smaller ranges need bigger commands (higher gain)
+                # Motors with larger ranges need smaller commands (lower gain)
+                motor_info[i] = {
+                    'channel': channel,
+                    'responsiveness': responsiveness,
+                    'min_range': min_range,
+                    'max_range': max_range
+                }
+                
+                # Set initial gain based on motor range
+                gain = 2.0 / responsiveness  # Inverse relationship: smaller range = higher gain
+                
+                # Set maximum adjustment size based on responsiveness
+                max_adjustment = 0.15 * responsiveness  # More responsive motors get smaller adjustments
+                
+                # Create PID controller with motor-specific parameters
+                pid = PIDController(kp=0.3, ki=0.05, kd=0.1, motor_gain=gain)
+                pid.set_max_adjustment(min(0.2, max_adjustment))  # Cap at 0.2 to prevent extreme movements
+                pid_controllers.append(pid)
+                
+                print(f"Motor {i} (channel {channel}): responsiveness={responsiveness:.2f}, gain={gain:.2f}, max_adj={max_adjustment:.2f}")
+        
+    except Exception as e:
+        print(f"Error setting up motor-specific PID controllers: {e}")
+        # Fallback to default PID controllers if motor info not available
+        pid_controllers = [PIDController(kp=0.3, ki=0.05, kd=0.1) for _ in range(num_motors)]
+    
+    # If we couldn't get motor info, create default controllers
+    if len(pid_controllers) != num_motors:
+        pid_controllers = [PIDController(kp=0.3, ki=0.05, kd=0.1) for _ in range(num_motors)]
     
     # Gradient descent parameters
     learning_rate = 0.05
@@ -107,6 +155,12 @@ async def optimize_motor_positions(human_blendshapes, model, motor_controller, f
     # Keep track of previous blendshape differences for calculating gradients
     previous_blendshape_diff = None
     previous_motor_positions = None
+    
+    # Keep track of each motor's effect on blendshapes
+    motor_effectiveness = np.ones(num_motors)  # Start with equal effectiveness
+    
+    # Track motor movement response over iterations
+    motor_response_tracking = [[] for _ in range(num_motors)]
     
     for i in range(max_iterations):
         # Capture current robot frame
@@ -171,6 +225,42 @@ async def optimize_motor_positions(human_blendshapes, model, motor_controller, f
         # Get current motor positions
         current_motor_positions = motor_controller.get_motor_positions().copy()
         
+        # Update motor effectiveness if we have previous data
+        if previous_blendshape_diff is not None and previous_motor_positions is not None:
+            delta_motors = current_motor_positions - previous_motor_positions
+            delta_error = np.sum(np.square(blendshape_diff)) - np.sum(np.square(previous_blendshape_diff))
+            
+            # For each motor that moved significantly
+            for j in range(num_motors):
+                if abs(delta_motors[j]) > 0.05:  # Only consider significant movements
+                    # Record the motor movement and resulting error change
+                    motor_response_tracking[j].append((delta_motors[j], delta_error))
+                    
+                    # Keep only the last 3 responses
+                    if len(motor_response_tracking[j]) > 3:
+                        motor_response_tracking[j].pop(0)
+                    
+                    # If we have enough data, calculate effectiveness
+                    if len(motor_response_tracking[j]) >= 2:
+                        # Calculate average error change per unit movement
+                        effectiveness = 0
+                        count = 0
+                        for move, err_change in motor_response_tracking[j]:
+                            if abs(move) > 0.001:  # Avoid division by very small values
+                                effectiveness += abs(err_change / move)
+                                count += 1
+                        
+                        if count > 0:
+                            avg_effectiveness = effectiveness / count
+                            # Update motor effectiveness (with smoothing)
+                            motor_effectiveness[j] = 0.7 * motor_effectiveness[j] + 0.3 * avg_effectiveness
+                            
+                            # Adjust PID gain based on effectiveness
+                            if motor_effectiveness[j] > 0:
+                                # More effective motors need lower gain
+                                response_factor = motor_effectiveness[j] / np.mean(motor_effectiveness)
+                                pid_controllers[j].adjust_gain(response_factor)
+        
         # Adaptive learning rate based on iteration and oscillation detection
         if len(mse_history) >= 3:
             if (mse_history[-3] < mse_history[-2] and mse_history[-2] > mse_history[-1]) or \
@@ -189,7 +279,7 @@ async def optimize_motor_positions(human_blendshapes, model, motor_controller, f
         # Prioritize the most significant differences
         blendshape_importance = np.abs(blendshape_diff)
         top_indices = np.argsort(blendshape_importance)[-min(num_motors, len(blendshape_importance)):]
-
+        
         # Apply PID control using weighted error signals
         for motor_idx in range(num_motors):
             # Use the top blendshape differences as error signals for each motor
@@ -198,6 +288,15 @@ async def optimize_motor_positions(human_blendshapes, model, motor_controller, f
                 # Use PID controller to calculate adjustment for this motor
                 pid_adjustment = pid_controllers[motor_idx].update(blendshape_diff[bs_idx])
                 motor_adjustments[motor_idx] += pid_adjustment
+                
+                # Analyze PID controller error trend and adapt parameters if needed
+                trend = pid_controllers[motor_idx].get_error_trend()
+                if trend == "oscillating":
+                    # Reduce gain to stabilize
+                    pid_controllers[motor_idx].adjust_gain(1.2)  # Increase divisor = reduce gain
+                elif trend == "stuck":
+                    # Increase gain to overcome sticking
+                    pid_controllers[motor_idx].adjust_gain(0.8)  # Decrease divisor = increase gain
         
         # Method 2: Gradient Descent
         if previous_blendshape_diff is not None and previous_motor_positions is not None:
@@ -220,8 +319,17 @@ async def optimize_motor_positions(human_blendshapes, model, motor_controller, f
                 previous_gradients = gradients.copy()
                 
                 # Update motors using gradients (negative because we want to minimize error)
+                # Scale by motor_effectiveness to give less responsive motors bigger adjustments
                 for j in range(num_motors):
-                    motor_adjustments[j] -= learning_rate * gradients[j]
+                    # Scale learning rate by inverse of effectiveness
+                    motor_specific_lr = learning_rate
+                    if motor_effectiveness[j] > 0:
+                        rel_effectiveness = motor_effectiveness[j] / np.mean(motor_effectiveness)
+                        if rel_effectiveness < 1.0:
+                            # Less effective motors get higher learning rate
+                            motor_specific_lr = learning_rate * (1.5 - 0.5 * rel_effectiveness)
+                    
+                    motor_adjustments[j] -= motor_specific_lr * gradients[j]
         
         # Store current state for next iteration
         previous_blendshape_diff = blendshape_diff.copy()
@@ -236,9 +344,9 @@ async def optimize_motor_positions(human_blendshapes, model, motor_controller, f
             # Blend between current position, PID/gradient adjustments, and model prediction
             # Weight between current position (stability), adjustments (improvement), and prediction (guidance)
             new_motor_positions = (
-                0.4 * current_motor_positions +                    # Stability component
+                0.4 * current_motor_positions +                      # Stability component
                 0.3 * (current_motor_positions + motor_adjustments) + # PID and gradient adjustments
-                0.3 * predicted_motor_positions                    # Model prediction component
+                0.3 * predicted_motor_positions                      # Model prediction component
             )
         except Exception as e:
             print(f"Error predicting motor positions: {e}")
@@ -246,12 +354,27 @@ async def optimize_motor_positions(human_blendshapes, model, motor_controller, f
             new_motor_positions = current_motor_positions + motor_adjustments
         
         # Add small exploration term that decreases over time
+        # Scale exploration by motor effectiveness - less effective motors get more exploration
         exploration_scale = 0.03 * (1.0 - min(0.9, i / max_iterations))
         exploration = np.random.normal(0, exploration_scale, size=len(new_motor_positions))
+        
+        # Scale exploration by inverse of motor effectiveness
+        for j in range(num_motors):
+            if motor_effectiveness[j] > 0:
+                rel_effectiveness = motor_effectiveness[j] / np.mean(motor_effectiveness)
+                if rel_effectiveness < 1.0:
+                    # Less effective motors get more exploration
+                    exploration[j] *= (1.5 - 0.5 * rel_effectiveness)
+        
         new_motor_positions += exploration
         
         # Ensure values are within valid range
         new_motor_positions = np.clip(new_motor_positions, -1.0, 1.0)
+        
+        # Print motor effectiveness and adjustments for debugging
+        if i % 3 == 0:  # Print every 3rd iteration to avoid clutter
+            print("Motor effectiveness:", ", ".join([f"{e:.2f}" for e in motor_effectiveness]))
+            print("Motor adjustments:", ", ".join([f"{a:.2f}" for a in motor_adjustments]))
         
         # Apply the adjusted motor positions
         motor_controller.adjust_motors(new_motor_positions)
@@ -260,21 +383,30 @@ async def optimize_motor_positions(human_blendshapes, model, motor_controller, f
         await asyncio.sleep(0.1)
     
     print(f"Optimization complete. Best MSE: {best_mse:.6f}, Total iterations: {i+1}")
+    print("Final motor effectiveness:", ", ".join([f"{e:.2f}" for e in motor_effectiveness]))
     return human_blendshapes, best_motor_positions
 
-# Simple PID Controller implementation
+# Simple PID Controller implementation with adaptive gain
 class PIDController:
-    def __init__(self, kp=0.2, ki=0.05, kd=0.1, setpoint=0):
+    def __init__(self, kp=0.2, ki=0.05, kd=0.1, setpoint=0, motor_gain=1.0):
         self.kp = kp  # Proportional gain
         self.ki = ki  # Integral gain
         self.kd = kd  # Derivative gain
         self.setpoint = setpoint
         self.previous_error = 0
         self.integral = 0
+        self.motor_gain = motor_gain  # Motor-specific gain multiplier
+        self.max_adjustment = 0.1  # Default max adjustment size
+        self.error_history = []  # Track error over time
         
     def update(self, measurement, dt=0.1):
         # Calculate error
         error = self.setpoint - measurement
+        
+        # Store error history (last 5 errors)
+        self.error_history.append(error)
+        if len(self.error_history) > 5:
+            self.error_history.pop(0)
         
         # Proportional term
         p_term = self.kp * error
@@ -291,10 +423,59 @@ class PIDController:
         # Calculate total output
         output = p_term + i_term + d_term
         
+        # Apply motor-specific gain - this helps motors with limited range
+        output *= self.motor_gain
+        
         # Limit output to valid range
-        output = np.clip(output, -0.1, 0.1)  # Limit size of adjustments for stability
+        output = np.clip(output, -self.max_adjustment, self.max_adjustment)
         
         return output
+    
+    def adjust_gain(self, response_factor):
+        """
+        Adjusts the gain based on motor's responsiveness.
+        
+        Args:
+            response_factor: Factor between 0.5 and 2.0 indicating motor responsiveness
+                            Values > 1 for more responsive motors (reduce gain)
+                            Values < 1 for less responsive motors (increase gain)
+        """
+        self.motor_gain = np.clip(self.motor_gain * (1.0 / response_factor), 0.5, 2.0)
+        
+    def set_max_adjustment(self, max_val):
+        """Sets the maximum adjustment size for this controller"""
+        self.max_adjustment = max_val
+        
+    def get_error_trend(self):
+        """
+        Analyzes recent error history to determine if errors are:
+        - Decreasing (convergence)
+        - Oscillating
+        - Stuck (not changing much)
+        - Increasing (divergence)
+        
+        Returns: string indicating trend
+        """
+        if len(self.error_history) < 3:
+            return "insufficient_data"
+            
+        # Check for oscillation
+        signs = [np.sign(e) for e in self.error_history]
+        if len(set(signs[-3:])) > 1:  # If signs are changing
+            return "oscillating"
+            
+        # Check for convergence/divergence
+        abs_errors = [abs(e) for e in self.error_history]
+        if abs_errors[-1] < abs_errors[0] * 0.8:
+            return "converging"
+        elif abs_errors[-1] > abs_errors[0] * 1.2:
+            return "diverging"
+            
+        # If errors are similar, we're stuck
+        if max(abs_errors) - min(abs_errors) < 0.05 * max(abs_errors):
+            return "stuck"
+            
+        return "normal"
 
 # Mimicry loop - converted to async and updated to use blendshapes
 async def mimicry_loop(human_cam_id, robot_cam_id, motor_controller, model, dataset, training_control):
@@ -352,6 +533,13 @@ async def mimicry_loop(human_cam_id, robot_cam_id, motor_controller, model, data
 
     # For drawing face mesh on the display (still useful for visualization)
     human_face_mesh = mp_face_mesh.FaceMesh(
+        static_image_mode=False, 
+        max_num_faces=1, 
+        min_detection_confidence=0.5,
+        refine_landmarks=True
+    )
+    
+    robot_face_mesh = mp_face_mesh.FaceMesh(
         static_image_mode=False, 
         max_num_faces=1, 
         min_detection_confidence=0.5,
@@ -415,9 +603,9 @@ async def mimicry_loop(human_cam_id, robot_cam_id, motor_controller, model, data
                     face_landmarker=face_landmarker,
                     robot_cap=robot_cap,
                     device=device,
-                    max_iterations=50,
-                    patience=10,
-                    improvement_threshold=0.0001
+                    max_iterations=30,
+                    patience=6,
+                    improvement_threshold=0.001
                 )
                 
                 # If optimization was successful, add the best data point to the dataset
@@ -438,7 +626,7 @@ async def mimicry_loop(human_cam_id, robot_cam_id, motor_controller, model, data
             robot_results = face_landmarker.detect(mp_robot_image)
             
             # Process with regular face mesh for visualization
-            robot_mesh_results = human_face_mesh.process(robot_rgb_frame)
+            robot_mesh_results = robot_face_mesh.process(robot_rgb_frame)
             
             # Draw facial landmarks on robot frame if enabled
             if show_face_mesh and robot_mesh_results.multi_face_landmarks:
@@ -530,6 +718,7 @@ async def mimicry_loop(human_cam_id, robot_cam_id, motor_controller, model, data
 
     # Clean up resources
     human_face_mesh.close()
+    robot_face_mesh.close()
     human_cap.release()
     robot_cap.release()
     cv2.destroyAllWindows()
@@ -778,6 +967,121 @@ def calculate_blendshape_mse(blendshapes1, blendshapes2):
         return float('inf')
     return np.mean(np.square(np.array(blendshapes1) - np.array(blendshapes2)))
 
+async def generate_initial_dataset(motor_controller, face_landmarker, robot_cap, device, samples_per_position=3):
+    """
+    Generate initial data points for the dataset with neutral position and min/max for each motor.
+    
+    Args:
+        motor_controller: Controller to adjust robot motors
+        face_landmarker: MediaPipe face landmarker for robot
+        robot_cap: OpenCV video capture for robot camera
+        device: Torch device (CPU/CUDA)
+        samples_per_position: Number of samples to collect for each position to average out noise
+        
+    Returns:
+        A list of tuples containing (blendshapes, motor_positions)
+    """
+    initial_data = []
+    
+    # Get the number of motors
+    num_motors = motor_controller.get_num_motors()
+    print(f"Generating initial dataset for {num_motors} motors...")
+    
+    # First, capture the neutral position (all motors at 0)
+    print("Setting all motors to neutral position...")
+    motor_controller.center_all_motors()
+    await asyncio.sleep(0.5)  # Give motors time to reach position
+    
+    # Capture neutral blendshapes
+    neutral_blendshapes = await capture_average_blendshapes(face_landmarker, robot_cap, samples_per_position)
+    if neutral_blendshapes is not None:
+        neutral_motors = motor_controller.get_motor_positions().copy()
+        initial_data.append((neutral_blendshapes, neutral_motors))
+        print(f"Added neutral position to dataset with {len(neutral_blendshapes)} blendshapes")
+    else:
+        print("Failed to capture neutral position blendshapes")
+    
+    # For each motor, capture min and max positions
+    for motor_idx in range(num_motors):
+        # Reset all motors to neutral
+        motor_controller.center_all_motors()
+        await asyncio.sleep(0.2)
+        
+        # Set this motor to max position (1.0)
+        print(f"Setting motor {motor_idx} to maximum position...")
+        max_motors = np.zeros(num_motors)
+        max_motors[motor_idx] = 1.0
+        motor_controller.adjust_motors(max_motors)
+        await asyncio.sleep(0.5)  # Give motors time to reach position
+        
+        # Capture max blendshapes
+        max_blendshapes = await capture_average_blendshapes(face_landmarker, robot_cap, samples_per_position)
+        if max_blendshapes is not None:
+            initial_data.append((max_blendshapes, max_motors.copy()))
+            print(f"Added max position for motor {motor_idx} to dataset")
+        else:
+            print(f"Failed to capture max position blendshapes for motor {motor_idx}")
+        
+        # Set this motor to min position (-1.0)
+        print(f"Setting motor {motor_idx} to minimum position...")
+        min_motors = np.zeros(num_motors)
+        min_motors[motor_idx] = -1.0
+        motor_controller.adjust_motors(min_motors)
+        await asyncio.sleep(0.5)  # Give motors time to reach position
+        
+        # Capture min blendshapes
+        min_blendshapes = await capture_average_blendshapes(face_landmarker, robot_cap, samples_per_position)
+        if min_blendshapes is not None:
+            initial_data.append((min_blendshapes, min_motors.copy()))
+            print(f"Added min position for motor {motor_idx} to dataset")
+        else:
+            print(f"Failed to capture min position blendshapes for motor {motor_idx}")
+    
+    # Return all motors to neutral position
+    motor_controller.center_all_motors()
+    
+    print(f"Generated {len(initial_data)} initial data points")
+    return initial_data
+
+async def capture_average_blendshapes(face_landmarker, cap, num_samples=3):
+    """
+    Capture multiple frames and average the blendshapes to reduce noise.
+    
+    Args:
+        face_landmarker: MediaPipe face landmarker
+        cap: OpenCV video capture
+        num_samples: Number of samples to average
+        
+    Returns:
+        Average blendshapes or None if face detection fails
+    """
+    all_blendshapes = []
+    
+    for _ in range(num_samples):
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to capture frame")
+            continue
+            
+        # Process frame to get blendshapes
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        results = face_landmarker.detect(mp_image)
+        blendshapes = extract_blendshapes(results)
+        
+        if blendshapes is not None:
+            all_blendshapes.append(blendshapes)
+        
+        # Brief pause between captures
+        await asyncio.sleep(0.1)
+    
+    # If we have at least one valid sample, compute the average
+    if all_blendshapes:
+        avg_blendshapes = np.mean(all_blendshapes, axis=0)
+        return avg_blendshapes
+    
+    return None
+
 # Main function
 async def main():
     # Define YAML file path for motor calibration
@@ -802,10 +1106,72 @@ async def main():
     dataset = RealTimeDataset()
     model = LandmarkToMotorModel(input_dim, output_dim)
     model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    device = next(model.parameters()).device
 
     # Define optimizer and loss function
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.MSELoss()
+
+    # Set up robot capture for initial data collection
+    robot_cap = cv2.VideoCapture(5)  # Use the same camera ID as in mimicry_loop
+    if not robot_cap.isOpened():
+        print("Error: Could not open robot camera for initial data collection.")
+        return
+    
+    try:
+        # Create MediaPipe Face Landmarker with blendshapes enabled
+        face_landmarker = create_face_landmarker()
+        print("MediaPipe Face Landmarker initialized with blendshapes")
+        
+        # Generate initial dataset with neutral, min, and max positions for each motor
+        print("Generating initial data points for the dataset...")
+        initial_data = await generate_initial_dataset(
+            motor_controller=motor_controller,
+            face_landmarker=face_landmarker,
+            robot_cap=robot_cap,
+            device=device,
+            samples_per_position=3
+        )
+        
+        # Add initial data points to the dataset
+        for blendshapes, motor_positions in initial_data:
+            dataset.add_data(blendshapes, motor_positions)
+        
+        print(f"Added {len(initial_data)} initial data points to the dataset")
+        
+        # Perform initial training to establish a baseline model
+        if len(dataset) > 0:
+            print("Performing initial training with baseline data...")
+            dataloader = DataLoader(dataset, batch_size=min(8, len(dataset)), shuffle=True)
+            
+            # Do a few epochs of initial training
+            for epoch in range(10):
+                total_loss = 0
+                for human_blendshapes, motor_positions in dataloader:
+                    # Move tensors to the correct device
+                    human_blendshapes = human_blendshapes.to(device)
+                    motor_positions = motor_positions.to(device)
+                    
+                    optimizer.zero_grad()
+                    # Forward pass
+                    predictions = model(human_blendshapes)
+                    # Compute loss
+                    loss = criterion(predictions, motor_positions)
+                    # Backward pass
+                    loss.backward()
+                    optimizer.step()
+                    
+                    total_loss += loss.item()
+                
+                # Print progress
+                avg_loss = total_loss / len(dataloader)
+                print(f"Initial training - Epoch {epoch+1}/10, Loss: {avg_loss:.6f}")
+    
+    except Exception as e:
+        print(f"Error during initial data generation: {e}")
+    finally:
+        # Release the camera when done
+        robot_cap.release()
 
     # Training control dictionary
     training_control = {'enabled': False}
